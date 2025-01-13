@@ -140,7 +140,7 @@ class T2IIterableDataset(IterableDataset):
             filename = osp.basename(filepath)
             h_div_w_template, num_of_samples = osp.splitext(filename)[0].split('_')
             num_of_samples = int(num_of_samples)
-            if num_of_samples < self.global_workers:
+            if num_of_samples < max(100, self.global_workers):
                 print(f'{filepath} has too few examples ({num_of_samples}, proportion: {num_of_samples/total_samples*100:.1f}%), < global workers ({self.global_workers})! Skip h_div_w_template: {h_div_w_template}')
                 continue
             print(f'{filepath} has sufficient examples ({num_of_samples}), proportion: {num_of_samples/total_samples*100:.1f}%, > global workers ({self.global_workers})! Preserve h_div_w_template: {h_div_w_template}')
@@ -159,6 +159,7 @@ class T2IIterableDataset(IterableDataset):
         def split_and_sleep(generator_info):
             missing, chunk_id2save_files = get_part_jsonls(generator_info['filepath'], generator_info['num_of_samples'], parts=self.num_replicas)
             if missing:
+                print(f'[data preprocess] missing {missing} files, sleep 10 minutes...')
                 tdist.barrier()
                 if self.rank == 0:
                     split_large_txt_files(generator_info['filepath'], chunk_id2save_files)
@@ -169,15 +170,20 @@ class T2IIterableDataset(IterableDataset):
                 tdist.barrier()
             generator_info['part_filepaths'] = sorted(list(chunk_id2save_files.values()))
             return generator_info
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()) as executor:
-            futures = {executor.submit(split_and_sleep, generator_info): h_div_w_template for h_div_w_template, generator_info in self.h_div_w_template2generator.items()}
-            for future in concurrent.futures.as_completed(futures):
-                h_div_w_template = futures[future]
-                try:
-                    self.h_div_w_template2generator[h_div_w_template] = future.result()
-                except Exception as exc:
-                    print(f'[data preprocess] h_div_w_template {h_div_w_template} generated an exception: {exc}')
+        if False:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, cpu_count())) as executor:
+                print(f'[data preprocess] split_meta_files with {min(32, cpu_count())} threads')
+                futures = {executor.submit(split_and_sleep, generator_info): h_div_w_template for h_div_w_template, generator_info in self.h_div_w_template2generator.items()}
+                for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc='split_meta_files'):
+                    h_div_w_template = futures[future]
+                    try:
+                        self.h_div_w_template2generator[h_div_w_template] = future.result()
+                        print(f'[data preprocess] h_div_w_template {h_div_w_template} split_meta_files done')
+                    except Exception as exc:
+                        print(f'[data preprocess] h_div_w_template {h_div_w_template} generated an exception: {exc}')
+        else:
+            for h_div_w_template, generator_info in self.h_div_w_template2generator.items():
+                self.h_div_w_template2generator[h_div_w_template] = split_and_sleep(generator_info)
 
         print('[data preprocess] split_meta_files done')
 
@@ -261,6 +267,7 @@ class T2IIterableDataset(IterableDataset):
                         c_, h_, w_ = model_input[1].shape[-3:]
                         if c_ != 3 or np.abs(h_/w_-float(h_div_w_template)) > 0.01:
                             print(f'Croupt data item: {data_item}')
+                            print(f'c_: {c_}, h_: {h_}, w_: {w_}, h_div_w_template: {h_div_w_template}, error: {np.abs(h_/w_-float(h_div_w_template))}')
                         else:
                             batch_data.append(model_input)
                     del data_item
@@ -323,7 +330,7 @@ class T2IIterableDataset(IterableDataset):
 
     def prepare_model_input(self, data_item) -> Tuple:
         img_path, h_div_w = data_item['image_path'], data_item['h_div_w']
-        short_text_input, long_text_input = data_item['text'], data_item['long_caption']
+        short_text_input, long_text_input = data_item.get('text', 'long_caption'), data_item['long_caption']
         long_text_type = data_item.get('long_caption_type', 'user_prompt')
         text_input = self.get_text_input(long_text_input, short_text_input, long_text_type)
         text_input = process_short_text(text_input)
